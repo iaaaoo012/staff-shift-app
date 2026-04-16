@@ -140,7 +140,7 @@ else:
         st.divider()
         st.header("🔗 従業員アンケートの共有")
         # 自分のアプリの実際のURLに合わせてここを修正してください
-        actual_url = "https://staff-shift.streamlit.app/?mode=staff" 
+        actual_url = "https://staff-shift.streamlit.app/" 
         st.write("以下のURLをコピーして従業員に送ってください：")
         st.code(f"{actual_url}?mode=staff")
 
