@@ -7,10 +7,15 @@ from streamlit_gsheets import GSheetsConnection
 st.set_page_config(layout="wide", page_title="シフト最適化システム")
 
 # --- 1. Google Sheets 接続設定 ---
-# 接続用オブジェクトを作成（デプロイ時にSecrets設定が必要）
-conn = st.connection("gsheets", type=GSheetsConnection)
+# 接続エラーでアプリが停止しないよう保護
+try:
+    conn = st.connection("gsheets", type=GSheetsConnection)
+except Exception as e:
+    st.error("Googleスプレッドシートへの接続に失敗しました。Secretsの設定を確認してください。")
+    st.stop()
 
 # --- 2. URLパラメータによる画面切り替え判定 ---
+# 最新のStreamlit仕様(st.query_params)を使用
 query_params = st.query_params
 is_staff_mode = query_params.get("mode") == "staff"
 
@@ -39,12 +44,10 @@ if is_staff_mode:
 
     st.divider()
 
-    # ※本来は店長の設定値をDBから読み込みますが、現在は動的生成
-    # (店長画面で設定を保存する仕組みを作ると、ここが自動で同期されます)
     st.subheader("希望日程・時間の入力")
     st.info("点数：入りたい(100) / 足りなきゃ(30) / 入れない(-30) / 絶対無理(-100)")
 
-    # 仮の日程（店長設定に合わせて変動するように設計）
+    # 仮の日程（今日から1週間分）
     start_d = datetime.today()
     end_d = start_d + timedelta(days=6)
     date_range = [start_d + timedelta(days=i) for i in range((end_d - start_d).days + 1)]
@@ -80,14 +83,15 @@ if is_staff_mode:
                 "送信日時": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }])
             try:
-                # Sheet1に追記
+                # 既存データを読み込んで結合
                 existing_data = conn.read(worksheet="Sheet1")
                 updated_df = pd.concat([existing_data, new_row], ignore_index=True)
                 conn.update(worksheet="Sheet1", data=updated_df)
                 st.success(f"送信完了しました。ありがとうございました！")
                 st.balloons()
-            except Exception:
-                st.warning("現在はローカル環境です。デプロイ後にスプレッドシートへ保存されます。")
+            except Exception as e:
+                # エラー内容を具体的に表示
+                st.error(f"保存に失敗しました。スプレッドシートの権限またはSecretsの設定を確認してください。エラー: {e}")
 
 # --- B. 店長モード (通常のURLの場合) ---
 else:
@@ -135,10 +139,10 @@ else:
 
         st.divider()
         st.header("🔗 従業員アンケートの共有")
-        # デプロイ後のURLに ?mode=staff を付与
-        staff_url = "https://your-app-name.streamlit.app/?mode=staff"
-        st.write("以下のURLを従業員に共有してください：")
-        st.code(staff_url)
+        # 自分のアプリの実際のURLに合わせてここを修正してください
+        actual_url = "https://staff-shift-app.streamlit.app/" 
+        st.write("以下のURLをコピーして従業員に送ってください：")
+        st.code(f"{actual_url}?mode=staff")
 
         st.header("🧬 最適化ロジック")
         avoid_gap = st.toggle("空き時間を作らない")
@@ -150,5 +154,5 @@ else:
         try:
             res_df = conn.read(worksheet="Sheet1")
             st.dataframe(res_df, use_container_width=True)
-        except:
+        except Exception:
             st.info("回答データがまだありません。")
