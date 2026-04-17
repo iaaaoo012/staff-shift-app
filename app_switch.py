@@ -57,22 +57,24 @@ if is_staff_mode:
         if not staff_name or not can_roles:
             st.error("入力漏れがあります。")
         else:
-            # 400エラー対策：辞書をJSON文字列に変換
+            # 1. 送信するデータを作成
             new_row = pd.DataFrame([{
                 "名前": staff_name,
                 "できる役職": ", ".join(can_roles),
                 "回答内容": json.dumps(current_answers, ensure_ascii=False),
                 "送信日時": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }])
+            
             try:
-                # データの書き込み（clearしてから更新することで安定性を向上）
-                existing_data = conn.read(worksheet="Sheet1")
-                updated_df = pd.concat([existing_data, new_row], ignore_index=True)
-                conn.update(worksheet="Sheet1", data=updated_df)
-                st.success("送信完了しました！")
+                # 2. ここを修正：読み込みを挟まず、直接シートの末尾に追加する
+                # worksheet="Sheet1" を指定
+                conn.create(worksheet="Sheet1", data=new_row) 
+                
+                st.success("送信完了しました！スプレッドシートを確認してください。")
                 st.balloons()
             except Exception as e:
-                st.error(f"保存に失敗しました。エラー: {e}")
+                # 具体的なエラーを表示
+                st.error(f"保存に失敗しました。以下のエラーを確認してください:\n{e}")
 
 # --- B. 店長モード ---
 else:
