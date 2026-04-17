@@ -2,43 +2,62 @@ import streamlit as st
 import pandas as pd
 import gspread
 import base64
-from google.oauth2.service_account import Credentials
 import json
+from google.oauth2.service_account import Credentials
 
 # --- 1. ページ設定 ---
 st.set_page_config(page_title="シフト希望提出システム", layout="centered")
 
-# --- 2. 安全な認証処理 ---
-def get_gspread_client():
-    # Secretsからサービスアカウント情報を読み込む
-    auth_info = st.secrets["gcp_service_account"]
+# --- 2. 認証処理の定義 ---
+def get_gspread_client_from_json(json_data):
+    """引数でもらったJSONデータで認証する"""
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(auth_info, scopes=scopes)
+    creds = Credentials.from_service_account_info(json_data, scopes=scopes)
     return gspread.authorize(creds)
 
-# --- 3. ログイン・認証制御 (URLパラメータ対応) ---
+def get_master_client():
+    """あなたのSecretsにある共通鍵で認証する（最初の読み込み用）"""
+    auth_info = st.secrets["gcp_service_account"]
+    return get_gspread_client_from_json(auth_info)
+
+# --- 3. 自動ログイン・データ取得ロジック ---
 st.title("🙋‍♂️ シフト希望提出")
 
-# URLパラメータ (?store=...) を取得
 query_params = st.query_params
 authenticated = False
 target_ss_url = ""
+client = None
 
+# A. URLパラメータがある場合 (店長発行のURL)
 if "store" in query_params:
-    # パラメータがある場合：自動ログイン試行
     try:
         encoded_url = query_params["store"]
         target_ss_url = base64.b64decode(encoded_url).decode()
+        
+        # まずあなたのマスター鍵で、そのシートの「SystemConfig」を読みに行く
+        # ※店長があなたのメールアドレスを共有している必要があります
+        master_client = get_master_client()
+        sh = master_client.open_by_url(target_ss_url)
+        config_ws = sh.worksheet("SystemConfig")
+        
+        # シートに保存されている店長専用のJSON鍵を取得
+        store_json_str = config_ws.acell("B2").value
+        store_json_data = json.loads(store_json_str)
+        
+        # その店長専用の鍵で再ログイン
+        client = get_gspread_client_from_json(store_json_data)
         authenticated = True
-    except:
-        st.error("URLが無効です。正しいURLを店長に確認してください。")
+    except Exception as e:
+        st.error(f"自動ログインに失敗しました。URLが正しいか、共有設定を確認してください。")
         st.stop()
+
+# B. パラメータがない場合 (従来のパスワード認証)
 else:
-    # パラメータがない場合：手動パスワード認証
     password = st.text_input("店舗パスワードを入力してください", type="password")
     if password == st.secrets["app_password"]:
-        authenticated = True
         target_ss_url = st.secrets["spreadsheet_url"]
+        client = get_master_client() # デフォルト設定を使用
+        authenticated = True
     elif password:
         st.error("パスワードが違います")
         st.stop()
@@ -46,10 +65,8 @@ else:
         st.info("URLリンクからアクセスするか、パスワードを入力してください。")
         st.stop()
 
-# --- 4. データの読み込み ---
-if authenticated:
-    client = get_gspread_client()
-
+# --- 4. データの読み込みとフォーム表示 ---
+if authenticated and client:
     @st.cache_data(ttl=10)
     def load_data(url):
         sh = client.open_by_url(url)
@@ -60,17 +77,15 @@ if authenticated:
     try:
         req_data, all_prefs = load_data(target_ss_url)
     except Exception as e:
-        st.error("データの読み込みに失敗しました。URLが正しいか、共有設定を確認してください。")
+        st.error("データの取得に失敗しました。シート名(Requirements/Preferences)を確認してください。")
         st.stop()
 
-    # --- 5. 入力フォーム (これまでの機能) ---
+    # --- 5. 入力フォーム (これまでの機能はすべて保持) ---
     name = st.text_input("あなたの名前（フルネーム）")
 
     if name:
-        # 既存の希望を確認
         user_prefs = all_prefs[all_prefs["名前"] == name] if not all_prefs.empty else pd.DataFrame()
         
-        # 役割の選択
         role_cols = [c for c in req_data.columns if c not in ["日付", "時間"]]
         st.subheader("🛠 担当できる役割")
         able_roles = []
@@ -78,13 +93,9 @@ if authenticated:
         for i, r in enumerate(role_cols):
             default_val = True
             if not user_prefs.empty:
-                # 過去に「不可(-100)」に設定していた役割はチェックを外す
-                if user_prefs[user_prefs["役割"] == r]["希望"].min() <= -100: 
-                    default_val = False
-            if cols[i].checkbox(r, value=default_val): 
-                able_roles.append(r)
+                if user_prefs[user_prefs["役割"] == r]["希望"].min() <= -100: default_val = False
+            if cols[i].checkbox(r, value=default_val): able_roles.append(r)
 
-        # 日付ごとの入力
         st.subheader("📅 出勤希望の回答")
         unique_dates = sorted(req_data["日付"].unique())
         options = [100, 30, 0, -100]
@@ -97,10 +108,8 @@ if authenticated:
                     if not user_prefs.empty:
                         t_pref = user_prefs[(user_prefs["日付"] == d) & (user_prefs["時間"] == t)]
                         if not t_pref.empty: 
-                            try: 
-                                default_idx = options.index(t_pref.iloc[0]["希望"])
-                            except: 
-                                default_idx = 0
+                            try: default_idx = options.index(t_pref.iloc[0]["希望"])
+                            except: default_idx = 0
                     
                     st.selectbox(f"【{t}】の希望", options, index=default_idx, 
                                  format_func=lambda x: {100:"◎ (入りたい)", 30:"△ (入れる)", 0:"× (休み希望)", -100:"不可"}[x], 
@@ -116,11 +125,9 @@ if authenticated:
                         for t in req_data[req_data["日付"] == d]["時間"].tolist():
                             score = st.session_state[f"p_{d}_{t}"]
                             for r in role_cols:
-                                # チェックしていない役割は強制的に「不可」
                                 final_score = score if r in able_roles else -100
                                 new_list.append({"名前": name, "日付": d, "時間": t, "役割": r, "希望": final_score})
                     
-                    # スプレッドシート上書き保存
                     sh = client.open_by_url(target_ss_url)
                     ws = sh.worksheet("Preferences")
                     other_prefs = all_prefs[all_prefs["名前"] != name] if not all_prefs.empty else pd.DataFrame()
