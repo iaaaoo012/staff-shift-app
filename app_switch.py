@@ -1,129 +1,102 @@
 import streamlit as st
 import pandas as pd
-from datetime import time, datetime, timedelta
-from streamlit_gsheets import GSheetsConnection
+import gspread
+from google.oauth2.service_account import Credentials
 import json
 
-st.set_page_config(layout="wide", page_title="シフト最適化システム")
+# --- 1. ページ設定 ---
+st.set_page_config(page_title="シフト希望提出システム", layout="centered")
 
-# --- 1. Google Sheets 接続設定 ---
-try:
-    conn = st.connection("gsheets", type=GSheetsConnection)
-except Exception as e:
-    st.error("接続失敗。Secretsを確認してください。")
+# --- 2. 安全な認証処理 (Secretsを使用) ---
+def get_gspread_client():
+    # Streamlit Cloudの設定画面(Secrets)に保存した情報を読み込む
+    # コード上に直接情報を書かないので、GitHubに上げても安全です
+    auth_info = st.secrets["gcp_service_account"]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(auth_info, scopes=scopes)
+    return gspread.authorize(creds)
+
+# --- 3. 簡易パスワード認証 ---
+# URLを知っている部外者の入力を防ぎます
+st.title("🙋‍♂️ シフト希望提出")
+password = st.text_input("店舗パスワードを入力してください", type="password")
+
+if password != st.secrets["app_password"]: # Secretsに設定したパスワードと照合
+    if password:
+        st.error("パスワードが違います")
+    st.info("正しいパスワードを入力すると入力画面が表示されます")
     st.stop()
 
-# --- 2. URLパラメータ判定 ---
-query_params = st.query_params
-is_staff_mode = query_params.get("mode") == "staff"
+# --- 4. データの読み込み ---
+client = get_gspread_client()
+spreadsheet_url = st.secrets["spreadsheet_url"] # SecretsからURLを取得
 
-# --- 3. 共通関数 ---
-def generate_slots(unit, start_h, end_h):
-    slots = []
-    current = datetime.combine(datetime.today(), time(0, 0)) + timedelta(hours=start_h)
-    limit = datetime.combine(datetime.today(), time(0, 0)) + timedelta(hours=end_h)
-    while current < limit:
-        h = current.hour
-        if current.date() > datetime.today().date(): h += 24
-        slots.append(f"{h:02d}:{current.strftime('%M')}")
-        current += timedelta(hours=unit)
-    return slots
+@st.cache_data(ttl=10) # 10秒間はデータをキャッシュして高速化
+def load_data(url):
+    sh = client.open_by_url(url)
+    req = pd.DataFrame(sh.worksheet("Requirements").get_all_records())
+    pref = pd.DataFrame(sh.worksheet("Preferences").get_all_records())
+    return req, pref
 
-# --- A. 従業員専用モード ---
-if is_staff_mode:
-    st.title("📝 従業員：シフト希望入力")
+try:
+    req_data, all_prefs = load_data(spreadsheet_url)
+except Exception as e:
+    st.error("データの読み込みに失敗しました。店長に連絡してください。")
+    st.stop()
+
+# --- 5. 入力フォーム ---
+name = st.text_input("あなたの名前（フルネーム）")
+
+if name:
+    # 既存の希望を確認
+    user_prefs = all_prefs[all_prefs["名前"] == name] if not all_prefs.empty else pd.DataFrame()
     
-    # 【自動化ポイント】店長の設定を読み込む
-    try:
-        settings_df = conn.read(worksheet="Settings")
-        conf = settings_df.iloc[0]
-        start_d = datetime.strptime(conf["開始日"], "%Y-%m-%d")
-        end_d = datetime.strptime(conf["終了日"], "%Y-%m-%d")
-        # 営業時間のスロットも店長設定に合わせる
-        slots = generate_slots(float(conf["時間間隔"]), int(conf["開始時"]), int(conf["終了時"]))
-    except:
-        # 読み込めない場合のデフォルト
-        start_d = datetime.today()
-        end_d = start_d + timedelta(days=6)
-        slots = generate_slots(1.0, 9, 21)
+    # 役割の選択
+    role_cols = [c for c in req_data.columns if c not in ["日付", "時間"]]
+    st.subheader("🛠 担当できる役割")
+    able_roles = []
+    cols = st.columns(len(role_cols))
+    for i, r in enumerate(role_cols):
+        default_val = True
+        if not user_prefs.empty:
+            if user_prefs[user_prefs["役割"] == r]["希望"].min() <= -100: default_val = False
+        if cols[i].checkbox(r, value=default_val): able_roles.append(r)
 
-    staff_name = st.text_input("お名前（名字のみ推奨）")
-    can_roles = st.multiselect("あなたができる役職", ["レジ", "キッチン", "ホール", "掃除"])
-
-    st.divider()
+    # 日付ごとの入力
+    st.subheader("📅 出勤希望の回答")
+    unique_dates = sorted(req_data["日付"].unique())
+    options = [100, 30, 0, -100]
     
-    date_range = [start_d + timedelta(days=i) for i in range((end_d - start_d).days + 1)]
-    options = ["入りたい", "足りなければ入る", "入りたくない", "絶対無理"]
+    for d in unique_dates:
+        with st.expander(f"📅 {d} の希望"):
+            day_slots = req_data[req_data["日付"] == d]["時間"].tolist()
+            for t in day_slots:
+                default_idx = 0
+                if not user_prefs.empty:
+                    t_pref = user_prefs[(user_prefs["日付"] == d) & (user_prefs["時間"] == t)]
+                    if not t_pref.empty: 
+                        try: default_idx = options.index(t_pref.iloc[0]["希望"])
+                        except: default_idx = 0
+                
+                st.selectbox(f"【{t}】の希望", options, index=default_idx, 
+                             format_func=lambda x: {100:"◎ (入りたい)", 30:"△ (入れる)", 0:"× (休み希望)", -100:"不可"}[x], 
+                             key=f"p_{d}_{t}")
 
-    date_tabs = st.tabs([d.strftime("%m/%d(%a)") for d in date_range])
-    current_answers = {}
-
-    for i, tab in enumerate(date_tabs):
-        with tab:
-            day_str = date_range[i].strftime("%m/%d(%a)")
-            day_df = pd.DataFrame({"時間": slots, "入りたい度": "入りたい"})
-            edited_res = st.data_editor(day_df, hide_index=True, use_container_width=True, key=f"ed_{day_str}")
-            current_answers[day_str] = edited_res.to_dict()
-
-    if st.button("全日程の回答を送信する"):
-        if not staff_name or not can_roles:
-            st.error("入力漏れがあります。")
-        else:
-            new_row = pd.DataFrame([{
-                "名前": staff_name,
-                "できる役職": ", ".join(can_roles),
-                "回答内容": json.dumps(current_answers, ensure_ascii=False),
-                "送信日時": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }])
-            try:
-                conn.create(worksheet="Sheet1", data=new_row)
-                st.success("送信完了しました！")
-                st.balloons()
-            except Exception as e:
-                st.error(f"保存失敗: {e}")
-
-# --- B. 店長モード ---
-else:
-    admin_pw = st.sidebar.text_input("管理者パスワード", type="password")
-    if admin_pw != "1234":
-        st.info("パスワードを入力してください。")
-        st.stop()
-
-    tab_admin, tab_staff_preview = st.tabs(["店長：設定画面", "従業員：回答状況"])
-    
-    with tab_admin:
-        st.sidebar.header("📅 シフト期間設定")
-        start_date = st.sidebar.date_input("作成開始日", datetime.today())
-        end_date = st.sidebar.date_input("作成終了日", datetime.today() + timedelta(days=7))
-
-        st.sidebar.header("⏰ 営業時間設定")
-        time_unit = st.sidebar.select_slider("刻み(時間)", options=[0.5, 1.0, 2.0], value=1.0)
-        biz_range = st.sidebar.select_slider("営業時間の範囲", options=[i for i in range(37)], value=(9, 21))
-
-        if st.sidebar.button("この設定を従業員画面に反映する"):
-            settings_data = pd.DataFrame([{
-                "開始日": start_date.strftime("%Y-%m-%d"),
-                "終了日": end_date.strftime("%Y-%m-%d"),
-                "時間間隔": time_unit,
-                "開始時": biz_range[0],
-                "終了時": biz_range[1]
-            }])
-            try:
-                # Settingsシートを上書き
-                conn.update(worksheet="Settings", data=settings_data)
-                st.sidebar.success("反映されました！URLを共有してください。")
-            except:
-                st.sidebar.error("Settingsシートを作成してください。")
-
-        st.header("🔗 共有用URL")
-        staff_url = f"https://iaaaoo012-staff-shift-app.streamlit.app/?mode=staff"
-        st.code(staff_url)
-        st.info("上記ボタンで反映後、このURLを配れば設定した期間の入力画面になります。")
-
-    with tab_staff_preview:
-        st.header("📊 回答状況")
-        try:
-            res_df = conn.read(worksheet="Sheet1")
-            st.dataframe(res_df, use_container_width=True)
-        except:
-            st.info("データがありません。")
+    if st.button("希望を送信する", type="primary"):
+        with st.spinner("送信中..."):
+            new_list = []
+            for d in unique_dates:
+                for t in req_data[req_data["日付"] == d]["時間"].tolist():
+                    score = st.session_state[f"p_{d}_{t}"]
+                    for r in role_cols:
+                        final_score = score if r in able_roles else -100
+                        new_list.append({"名前": name, "日付": d, "時間": t, "役割": r, "希望": final_score})
+            
+            # スプレッドシート上書き保存
+            sh = client.open_by_url(spreadsheet_url)
+            ws = sh.worksheet("Preferences")
+            other_prefs = all_prefs[all_prefs["名前"] != name] if not all_prefs.empty else pd.DataFrame()
+            final_df = pd.concat([other_prefs, pd.DataFrame(new_list)], ignore_index=True)
+            ws.clear()
+            ws.update([final_df.columns.values.tolist()] + final_df.values.tolist())
+            st.success("無事に送信されました。お疲れ様でした！")
