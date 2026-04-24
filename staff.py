@@ -34,29 +34,43 @@ if "store" in query_params:
         encoded_url = query_params["store"]
         target_ss_url = base64.b64decode(encoded_url).decode()
         
-        # まずあなたのマスター鍵で、そのシートの「SystemConfig」を読みに行く
-        # ※店長があなたのメールアドレスを共有している必要があります
+        # 1. あなたのマスター鍵で、そのシートの「SystemConfig」を読みに行く
         master_client = get_master_client()
         sh = master_client.open_by_url(target_ss_url)
         config_ws = sh.worksheet("SystemConfig")
         
-        # シートに保存されている店長専用のJSON鍵を取得
-        store_json_str = config_ws.acell("B2").value
-        store_json_data = json.loads(store_json_str)
+        # 2. B2セルに保存されている統合設定データを取得
+        val = config_ws.acell("B2").value
+        config_all = json.loads(val)
         
-        # その店長専用の鍵で再ログイン
+        # 3. 店長専用のJSON鍵を取り出す
+        store_json_data = config_all["JSON_KEY"]
+        
+        # 4. 【追加】管理者側で保存したカスタム設定（役割など）を復元
+        if "SETTINGS" in config_all:
+            settings = config_all["SETTINGS"]
+            # セッションに保存して後の処理で使えるようにする
+            if "roles" in settings:
+                st.session_state.last_roles = settings["roles"]
+            if "custom_blocks" in settings:
+                st.session_state.custom_blocks = settings["custom_blocks"]
+        
+        # 5. その店長専用の鍵で再ログイン
         client = get_gspread_client_from_json(store_json_data)
         authenticated = True
+        
     except Exception as e:
-        st.error(f"自動ログインに失敗しました。URLが正しいか、共有設定を確認してください。")
+        # デバッグ用：必要に応じて st.error(f"詳細: {e}") に書き換えてください
+        st.error("自動ログインに失敗しました。URLが正しいか、管理者が『紐付け』済みか確認してください。")
         st.stop()
 
 # B. パラメータがない場合 (従来のパスワード認証)
 else:
+    # (既存のパスワード認証ロジック)
     password = st.text_input("店舗パスワードを入力してください", type="password")
     if password == st.secrets["app_password"]:
         target_ss_url = st.secrets["spreadsheet_url"]
-        client = get_master_client() # デフォルト設定を使用
+        client = get_master_client()
         authenticated = True
     elif password:
         st.error("パスワードが違います")
